@@ -1,0 +1,99 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("AGENT_DATABASE_URL")
+}
+
+enum ConversationStatus {
+  ACTIVE
+  ARCHIVED
+  DELETED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  TOOL
+  SYSTEM
+}
+
+enum MemoryType {
+  FACT
+  PREFERENCE
+  CONTACT
+  TASK
+  NOTE
+}
+
+model Conversation {
+  id             String             @id @default(uuid())
+  userId         String?
+  title          String?
+  systemPrompt   String?            @db.Text
+  provider       String                                  // "anthropic" | "openai" | "local"
+  model          String?
+  status         ConversationStatus @default(ACTIVE)
+  metadata       Json?
+  expiresAt      DateTime
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  messages       Message[]
+  toolExecutions ToolExecution[]
+
+  @@index([userId, createdAt])
+  @@index([status, expiresAt])
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String
+  role           MessageRole
+  /// Vendor-neutral content. For text-only: `{ blocks: [{ type: "text", text: "..." }] }`.
+  /// For tool use: includes tool_use/tool_result blocks.
+  content        Json
+  tokensIn       Int?
+  tokensOut      Int?
+  cachedTokens   Int?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+model ToolExecution {
+  id             String       @id @default(uuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String
+  toolUseId      String                       // ID assigned by the LLM for this call
+  toolName       String
+  input          Json
+  output         Json?
+  error          String?
+  durationMs     Int?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([toolName])
+}
+
+/// Persistent memory per user — facts/preferences/contacts that the agent
+/// auto-loads into the system prompt at the start of every conversation.
+/// Acts like a lightweight Obsidian: each entry is a key→value with a type.
+model Memory {
+  id        String     @id @default(uuid())
+  userId    String                            // owner
+  key       String                            // e.g. "default_email_from", "favorite_whatsapp_number"
+  value     String     @db.Text
+  type      MemoryType @default(FACT)
+  metadata  Json?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([userId, key])
+  @@index([userId, type])
+}
