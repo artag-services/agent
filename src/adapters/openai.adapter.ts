@@ -14,11 +14,28 @@ import {
 } from '../common/types'
 
 /**
- * OpenAI adapter — translates our `ContentBlock[]` representation into
- * OpenAI's `tool_calls` / `role: "tool"` format and back.
+ * OpenAI-compatible adapter — translates our `ContentBlock[]` representation
+ * into OpenAI's `tool_calls` / `role: "tool"` format and back.
  *
- * Multi-key support via `OPENAI_API_KEYS` (comma-separated). Default model:
- * `OPENAI_MODEL` (default: gpt-4o-mini).
+ * Works with ANY provider that exposes an OpenAI-compatible REST API:
+ *   - OpenAI:       https://api.openai.com/v1                      (default)
+ *   - Nvidia NIM:   https://integrate.api.nvidia.com/v1
+ *   - Groq:         https://api.groq.com/openai/v1
+ *   - Together AI:  https://api.together.xyz/v1
+ *   - OpenRouter:   https://openrouter.ai/api/v1
+ *   - DeepSeek:     https://api.deepseek.com/v1
+ *   - xAI Grok:     https://api.x.ai/v1
+ *   - Mistral:      https://api.mistral.ai/v1
+ *
+ * To switch provider: set `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and
+ * `OPENAI_MODEL` to the values for that provider. The same adapter handles
+ * all of them.
+ *
+ * Multi-key support via `OPENAI_API_KEYS` (comma-separated) for round-robin
+ * with auto-rotation on 429/401.
+ *
+ * Tool-use support depends on the model — most modern Llama/Mistral/GPT
+ * variants support it; smaller open models may not.
  */
 @Injectable()
 export class OpenAiAdapter implements AiAdapter {
@@ -33,7 +50,8 @@ export class OpenAiAdapter implements AiAdapter {
 
   constructor(private readonly config: ConfigService) {
     const keys = this.parseKeys()
-    this.clients = keys.map((apiKey) => new OpenAI({ apiKey }))
+    const baseURL = this.config.get<string>('OPENAI_BASE_URL') // undefined = OpenAI default
+    this.clients = keys.map((apiKey) => new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) }))
     this.defaultModel = this.config.get<string>('OPENAI_MODEL') ?? 'gpt-4o-mini'
 
     if (this.clients.length === 0) {
@@ -41,8 +59,9 @@ export class OpenAiAdapter implements AiAdapter {
         'No OPENAI_API_KEY(S) configured — OpenAiAdapter will throw on every call',
       )
     } else {
+      const target = baseURL ?? 'api.openai.com'
       this.logger.log(
-        `OpenAiAdapter ready with ${this.clients.length} key(s), model=${this.defaultModel}`,
+        `OpenAiAdapter ready: ${this.clients.length} key(s) → ${target} | model=${this.defaultModel}`,
       )
     }
   }
