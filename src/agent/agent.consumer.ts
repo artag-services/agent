@@ -99,6 +99,18 @@ export class AgentConsumer implements OnModuleInit {
           where: { id },
           data: { status: ConversationStatus.DELETED },
         })
+        // CQRS: announce the soft-delete so the read model hides it.
+        try {
+          this.rabbitmq.publish('data.agent.conversation.deleted', {
+            conversationId: id,
+            channel: 'agent',
+            deletedAt: new Date().toISOString(),
+          })
+        } catch (err) {
+          this.logger.warn(
+            `Failed to publish data.agent.conversation.deleted for ${id}: ${(err as Error).message}`,
+          )
+        }
         return { id, deleted: true }
       }
       case 'list_memories': {

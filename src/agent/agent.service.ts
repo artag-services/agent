@@ -40,6 +40,18 @@ interface ChatResponse {
 
 const MAX_TOOL_LOOP_ITERATIONS = 10
 
+/**
+ * CQRS routing keys consumed by sync-service. Producer-side rule: always
+ * emit AFTER Postgres has committed. Final-reply emission only fires for
+ * the user-visible response, NOT for intermediate tool-loop iterations.
+ */
+const DATA_EVENTS = {
+  CONVERSATION_CREATED: 'data.agent.conversation.created',
+  CONVERSATION_DELETED: 'data.agent.conversation.deleted',
+  MESSAGE_RECEIVED: 'data.agent.message.received',
+  MESSAGE_SENT: 'data.agent.message.sent',
+} as const
+
 @Injectable()
 export class AgentService {
   private readonly logger = new Logger(AgentService.name)
@@ -59,7 +71,24 @@ export class AgentService {
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    const conversation = await this.loadOrCreateConversation(req.conversationId, req.userId)
+    const { conversation, wasCreated } = await this.loadOrCreateConversation(
+      req.conversationId,
+      req.userId,
+    )
+    if (wasCreated) {
+      this.publishDataEvent(DATA_EVENTS.CONVERSATION_CREATED, {
+        conversationId: conversation.id,
+        userId: conversation.userId,
+        channel: 'agent',
+        // The agent owner doubles as channelUserId — read model needs a value.
+        channelUserId: conversation.userId ?? conversation.id,
+        topic: conversation.title ?? null,
+        status: conversation.status,
+        aiEnabled: true,
+        createdAt: conversation.createdAt.toISOString(),
+      })
+    }
+
     const previousMessages = await this.loadMessages(conversation.id)
 
     // Build the message list for the LLM (vendor-neutral)
@@ -77,9 +106,20 @@ export class AgentService {
     const systemPrompt = buildSystemPrompt(memorySection, req.userId)
 
     // Persist the user message before calling the LLM
-    await this.persistMessage(conversation.id, MessageRole.USER, [
+    const userMessage = await this.persistMessage(conversation.id, MessageRole.USER, [
       { type: 'text', text: req.message },
     ])
+
+    // CQRS: announce the user turn to the read model.
+    this.publishDataEvent(DATA_EVENTS.MESSAGE_RECEIVED, {
+      messageId: userMessage.id,
+      conversationId: conversation.id,
+      userId: req.userId ?? conversation.userId,
+      senderId: req.userId ?? conversation.userId ?? conversation.id,
+      channelUserId: req.userId ?? conversation.userId ?? conversation.id,
+      content: req.message,
+      timestamp: userMessage.createdAt.toISOString(),
+    })
 
     this.publishEvent(ROUTING_KEYS.EVENT_MESSAGE_STARTED, {
       conversationId: conversation.id,
@@ -107,7 +147,7 @@ export class AgentService {
       totalCachedTokens += result.usage.cachedInputTokens ?? 0
 
       // Persist assistant message with all blocks (including tool_use)
-      await this.persistMessage(
+      const assistantMessage = await this.persistMessage(
         conversation.id,
         MessageRole.ASSISTANT,
         result.content,
@@ -124,6 +164,19 @@ export class AgentService {
           userId: req.userId,
           finalText: result.text,
           toolsUsed: toolsUsed.length,
+        })
+
+        // CQRS: announce the user-visible reply to the read model. Only
+        // fires for FINAL replies — intermediate tool-loop iterations are
+        // not projected (they're agent-internal debug info).
+        this.publishDataEvent(DATA_EVENTS.MESSAGE_SENT, {
+          messageId: assistantMessage.id,
+          conversationId: conversation.id,
+          userId: req.userId ?? conversation.userId,
+          recipient: req.userId ?? conversation.userId ?? conversation.id,
+          channelUserId: req.userId ?? conversation.userId ?? conversation.id,
+          content: result.text,
+          timestamp: assistantMessage.createdAt.toISOString(),
         })
 
         return {
@@ -241,14 +294,16 @@ export class AgentService {
   private async loadOrCreateConversation(
     conversationId?: string,
     userId?: string,
-  ): Promise<Conversation> {
+  ): Promise<{ conversation: Conversation; wasCreated: boolean }> {
     if (conversationId) {
       const existing = await this.prisma.conversation.findUnique({ where: { id: conversationId } })
-      if (existing && existing.status === ConversationStatus.ACTIVE) return existing
+      if (existing && existing.status === ConversationStatus.ACTIVE) {
+        return { conversation: existing, wasCreated: false }
+      }
     }
 
     const adapter = this.adapters.get()
-    return this.prisma.conversation.create({
+    const conversation = await this.prisma.conversation.create({
       data: {
         userId,
         provider: adapter.name,
@@ -256,6 +311,7 @@ export class AgentService {
         expiresAt: new Date(Date.now() + this.conversationTtlMs),
       },
     })
+    return { conversation, wasCreated: true }
   }
 
   private async loadMessages(conversationId: string): Promise<Message[]> {
@@ -278,8 +334,8 @@ export class AgentService {
     tokensIn?: number,
     tokensOut?: number,
     cachedTokens?: number,
-  ): Promise<void> {
-    await this.prisma.message.create({
+  ): Promise<Message> {
+    return this.prisma.message.create({
       data: {
         conversationId,
         role,
@@ -298,6 +354,20 @@ export class AgentService {
       this.rabbitmq.publish(routingKey, payload)
     } catch (err) {
       this.logger.warn(`Failed to publish event ${routingKey}: ${(err as Error).message}`)
+    }
+  }
+
+  /**
+   * Same as publishEvent but specifically for `data.*` CQRS routing keys.
+   * Kept separate for grep-ability and so we can log differently if needed.
+   */
+  private publishDataEvent(routingKey: string, payload: Record<string, unknown>): void {
+    try {
+      this.rabbitmq.publish(routingKey, payload)
+    } catch (err) {
+      this.logger.warn(
+        `Failed to publish CQRS event ${routingKey}: ${(err as Error).message}`,
+      )
     }
   }
 }
